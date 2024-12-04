@@ -23,11 +23,23 @@ struct {
   struct run *freelist;
 } kmem;
 
+struct { //reference count struct for pages (for COW)
+  struct spinlock lock;
+  int count[(PGROUNDUP(PHYSTOP) - KERNBASE) / PGSIZE];
+} refcnt;
+
 void
 kinit()
 {
   initlock(&kmem.lock, "kmem");
+  initlock (&refcnt.lock, "refcnt");
+
+  for(int i=0; i<(PGROUNDUP(PHYSTOP) - KERNBASE) / PGSIZE; i++){
+    refcnt.count[i] = 1; //initialize all page reference counts to 1
+  }
+
   freerange(end, (void*)PHYSTOP);
+  
 }
 
 void
@@ -51,6 +63,13 @@ kfree(void *pa)
   if(((uint64)pa % PGSIZE) != 0 || (char*)pa < end || (uint64)pa >= PHYSTOP)
     panic("kfree");
 
+  if (ref_get(pa) <= 0) 
+    panic("kfree: decrementing ref count already 0");
+
+  ref_decr(pa); // decrement reference count for the page being freed
+  if(ref_get(pa) > 0) // if the reference count is still greater than 0, child still alive, don't free the page
+    return;
+    
   // Fill with junk to catch dangling refs.
   memset(pa, 1, PGSIZE);
 
@@ -76,7 +95,39 @@ kalloc(void)
     kmem.freelist = r->next;
   release(&kmem.lock);
 
-  if(r)
+  if(r){
     memset((char*)r, 5, PGSIZE); // fill with junk
+    ref_incr(r);
+  }
   return (void*)r;
+}
+
+// increment reference count for a page
+void
+ref_incr(void *pa)
+{
+  acquire(&refcnt.lock);
+  refcnt.count[PA2IDX(pa)]++;
+  release(&refcnt.lock);
+}
+
+// decrement reference count for a page
+void
+ref_decr(void *pa)
+{
+  acquire(&refcnt.lock);
+  refcnt.count[PA2IDX(pa)]--;
+  release(&refcnt.lock);
+}
+
+// get reference count for a page
+int
+ref_get(void *pa)
+{
+  int count;
+  acquire(&refcnt.lock);
+  count = refcnt.count[PA2IDX(pa)];
+  release(&refcnt.lock);
+  //printf("ref count for page %p is %d\n", pa, count);
+  return count;
 }
